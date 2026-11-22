@@ -33,7 +33,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2026 (a2cnsmr)</string>
+    <string>Copyright © 2026 a2cnsmr</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -52,25 +52,27 @@ if [ -d "AppIcon.iconset" ] && command -v iconutil >/dev/null 2>&1; then
     echo "アイコンを組み込みました: AppIcon.icns"
 fi
 
-# 署名 (安定した証明書で署名しないと、macOS が別アプリ扱いして
-# アクセシビリティ許可が起動のたびにリセットされる)
+# 署名 (任意。証明書があれば安定した署名に、なければ ad-hoc 署名になる。
+# どちらでも動作は同じ)
 # SIGN_IDENTITY で証明書名を明示指定できる (未指定なら最初の証明書を自動検出)
 IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"[^"]*"' | head -n 1 | tr -d '"' || true)}"
 if [ -n "$IDENTITY" ]; then
     codesign --force --deep --sign "$IDENTITY" "$APP"
     echo "署名しました: $IDENTITY"
+    if [ -z "${SIGN_IDENTITY:-}" ]; then
+        echo "(証明書を自動検出しました。証明書が複数ある場合は、意図しないものが選ばれることがあるので"
+        echo " SIGN_IDENTITY=\"証明書名\" bash build_app.sh のように明示指定を推奨します)"
+    fi
 else
     codesign --force --deep --sign - "$APP"
-    echo "注意: コード署名用の証明書が見つからないため、その場限りの署名 (ad-hoc) をしました。"
-    echo "この場合、アクセシビリティ許可が毎回求められることがあります。"
-    echo "解消法: キーチェーンアクセス > 証明書アシスタント > 証明書を作成... で、"
+    echo "コード署名用の証明書が見つからないため、その場限りの署名 (ad-hoc) をしました。"
+    echo "このままでも動作します。安定した署名にしたい場合は、"
+    echo "キーチェーンアクセス > 証明書アシスタント > 証明書を作成... で、"
     echo "「自分で署名したルート」「コード署名」の証明書を1つ作ってから再ビルドしてください。"
     echo "(Xcode に Apple ID でサインイン済みなら Apple Development 証明書が自動で使われます)"
 fi
 
 echo ""
 echo "完成: $APP"
-echo "初回は アクセシビリティ許可 が必要です:"
-echo "  1. $APP を起動する"
-echo "  2. システム設定 > プライバシーとセキュリティ > アクセシビリティ で許可する"
-echo "  3. アプリを再起動する"
+echo "起動: open $APP"
+echo "(アクセシビリティ許可などの設定は不要です)"

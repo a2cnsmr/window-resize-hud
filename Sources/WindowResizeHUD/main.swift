@@ -6,17 +6,25 @@
 //
 // 仕組み:
 //  - CGWindowList で画面上のウインドウ一覧 (位置と大きさ) を取得する
-//  - グローバルマウスモニタで、ウインドウの縁 (約6pt以内) でのドラッグ開始を検知し、
-//    その時点でオーバーレイを表示する (ホバーでは表示しない)
-//  - ドラッグ中はタイマーでウインドウの大きさをポーリングし、矩形と数値を追従させる
+//  - ウインドウの縁 (約6pt以内、外側含む) でドラッグが始まったら、そのウインドウを
+//    リサイズ候補として記録する。候補の探索は、カーソルを含む一番手前のウインドウで
+//    打ち切る (背面ウインドウの誤検出防止)
+//  - 押下時点のサイズを覚えておき、実際にサイズが変わった時点で初めてオーバーレイを
+//    表示する (タイトルバーのクリックやウインドウ移動では表示しない)
+//  - ドラッグ中は対象ウインドウだけを CGWindowList (.optionIncludingWindow) で
+//    約60fps取得し、矩形と数値を追従させる
+//  - オーバーレイは「対象ウインドウ＋ラベル用の余白」の大きさの小さなウインドウで、
+//    対象に追従して動く (全画面1枚ではないので、マルチディスプレイでも対象のある
+//    画面に描画される)
 //  - マウスボタンを離したらオーバーレイを消す
 //
 // 注意: 他アプリのウインドウの「リサイズ開始/終了」を知らせる公式APIはないため、
 // マウスの押下/ドラッグ/解放とウインドウ矩形の変化から推定している。
-// グローバルマウスモニタには「アクセシビリティ」許可が必要。
+// マウスイベントのグローバル監視とウインドウ矩形の取得には「アクセシビリティ」
+// 許可は不要 (2026-11-22、許可オフの状態で動作することを実機確認済み)。
+// 許可が必要になるのはキーイベントの監視などに限られる。
 
 import AppKit
-import ApplicationServices
 import CoreGraphics
 
 // MARK: - 座標変換
@@ -75,12 +83,16 @@ func windowsFrontToBack() -> [WindowInfo] {
     return result
 }
 
-func topWindow(underCGPoint point: CGPoint) -> WindowInfo? {
-    windowsFrontToBack().first { $0.bounds.contains(point) }
-}
-
+/// 対象ウインドウ1つだけを取得する (ドラッグ中のポーリング用。全件取得より軽い)
 func window(withID id: CGWindowID) -> WindowInfo? {
-    windowsFrontToBack().first { $0.id == id }
+    guard
+        let raw = CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]],
+        let info = raw.first,
+        let pid = info[kCGWindowOwnerPID as String] as? NSNumber,
+        let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+        let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
+    else { return nil }
+    return WindowInfo(id: id, bounds: bounds, ownerPID: pid.int32Value)
 }
 
 /// カーソルがウインドウの縁 (外側/内側 tolerance 以内) にあるか
@@ -99,17 +111,18 @@ final class OverlayView: NSView {
     var targetRectScreen: NSRect?
     /// カーソル位置 (AppKitのスクリーン座標)
     var mouseScreen: NSPoint = .zero
+    /// オーバーレイウインドウの原点 (スクリーン座標)。描画時にローカル座標へ変換する
+    var windowOrigin: NSPoint = .zero
     var sizeText: String = ""
 
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard let target = targetRectScreen, let win = window else { return }
-        // スクリーン座標 -> このビューの座標 (ウインドウの原点分を引く)
+        guard let target = targetRectScreen else { return }
         let rect = NSRect(
-            x: target.minX - win.frame.minX,
-            y: target.minY - win.frame.minY,
+            x: target.minX - windowOrigin.x,
+            y: target.minY - windowOrigin.y,
             width: target.width,
             height: target.height
         )
@@ -133,11 +146,24 @@ final class OverlayView: NSView {
         let padding: CGFloat = 8
         let labelSize = NSSize(width: textSize.width + padding * 2, height: textSize.height + padding * 2)
 
-        let mouse = NSPoint(x: mouseScreen.x - win.frame.minX, y: mouseScreen.y - win.frame.minY)
+        let mouse = NSPoint(x: mouseScreen.x - windowOrigin.x, y: mouseScreen.y - windowOrigin.y)
         var origin = NSPoint(x: mouse.x + 16, y: mouse.y + 16)
-        // オーバーレイの外にはみ出さないように収める
-        origin.x = min(max(origin.x, bounds.minX + 2), bounds.maxX - labelSize.width - 2)
-        origin.y = min(max(origin.y, bounds.minY + 2), bounds.maxY - labelSize.height - 2)
+
+        // ラベルは「カーソルのある画面」の内側に収める
+        // (全画面のunion基準だと、どの画面にも映らない位置に出ることがある)
+        var clampRect = bounds
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouseScreen) }) {
+            let s = NSRect(
+                x: screen.frame.minX - windowOrigin.x,
+                y: screen.frame.minY - windowOrigin.y,
+                width: screen.frame.width,
+                height: screen.frame.height
+            )
+            let inter = bounds.intersection(s)
+            if !inter.isNull { clampRect = inter }
+        }
+        origin.x = min(max(origin.x, clampRect.minX + 2), clampRect.maxX - labelSize.width - 2)
+        origin.y = min(max(origin.y, clampRect.minY + 2), clampRect.maxY - labelSize.height - 2)
         let labelRect = NSRect(origin: origin, size: labelSize)
 
         let bg = NSBezierPath(roundedRect: labelRect, xRadius: 6, yRadius: 6)
@@ -151,11 +177,13 @@ final class OverlayView: NSView {
 final class OverlayController {
     private var window: NSWindow?
     private let view = OverlayView()
+    /// ラベルを表示するための余白 (対象ウインドウの周囲にこの分だけ広げる)
+    /// ラベルの幅 (約100pt) + カーソルからのずらし (16pt) が収まる広さにする
+    private let margin: CGFloat = 140
 
-    private func ensureWindow() -> NSWindow {
+    private func obtainWindow() -> NSWindow {
         if let window { return window }
-        let frame = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
-        let w = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
@@ -169,11 +197,21 @@ final class OverlayController {
     }
 
     func show(windowRectCG rect: CGRect, mouse: NSPoint) {
-        let w = ensureWindow()
-        view.targetRectScreen = toNSRect(rect)
+        let target = toNSRect(rect)
+        let frame = target.insetBy(dx: -margin, dy: -margin)
+        let w = obtainWindow()
+        // 先に中身を更新してから、ウインドウの移動と再描画を同時に行う
+        // (移動だけ先にすると、枠が1フレームずれて見えることがある)
+        view.frame = NSRect(origin: .zero, size: frame.size)
+        view.windowOrigin = frame.origin
+        view.targetRectScreen = target
         view.mouseScreen = mouse
         view.sizeText = "\(Int(rect.width.rounded())) × \(Int(rect.height.rounded()))"
-        view.needsDisplay = true
+        if w.frame != frame {
+            w.setFrame(frame, display: true)
+        } else {
+            view.needsDisplay = true
+        }
         if !w.isVisible { w.orderFrontRegardless() }
     }
 
@@ -197,13 +235,20 @@ final class ResizeTracker {
     private let overlay = OverlayController()
     private var monitors: [Any] = []
     private var draggingID: CGWindowID?
+    /// 押下時点のウインドウサイズ。実際にサイズが変わるまで表示しない
+    private var dragStartSize: CGSize?
+    /// 一度サイズ変化を検出したら、そのドラッグ中は表示を続ける
+    private var hudVisible = false
     private var pollTimer: Timer?
 
     func start() {
         // ホバーでは表示しない (縁をなぞるたびに出て目がちらつくため)。
-        // 表示はドラッグ開始 (リサイズ開始) からマウスを離すまで。
+        // 表示はドラッグで実際にサイズが変わってから、マウスを離すまで。
         addMonitor(.leftMouseDown) { [weak self] _ in self?.handleMouseDown() }
-        addMonitor(.leftMouseDragged) { [weak self] _ in self?.overlay.updateMouse(NSEvent.mouseLocation) }
+        addMonitor(.leftMouseDragged) { [weak self] _ in
+            guard let self, self.hudVisible else { return }
+            self.overlay.updateMouse(NSEvent.mouseLocation)
+        }
         addMonitor(.leftMouseUp) { [weak self] _ in self?.handleMouseUp() }
     }
 
@@ -214,41 +259,46 @@ final class ResizeTracker {
     }
 
     private func handleMouseDown() {
-        let mouse = NSEvent.mouseLocation
-        let cg = toCGPoint(mouse)
+        let cg = toCGPoint(NSEvent.mouseLocation)
         guard let target = resizeTarget(atCGPoint: cg) else { return }
         draggingID = target.id
-        overlay.show(windowRectCG: target.bounds, mouse: mouse)
+        dragStartSize = target.bounds.size
+        hudVisible = false
         startPolling()
+        // ここではまだ表示しない
     }
 
     /// ドラッグ開始位置からリサイズ対象のウインドウを探す。
     /// 縁つかみはウインドウの数px外側 (影のあたり) で起こることが多いため、
     /// 「点を含むウインドウ」だけでなく「縁の帯 (外側含む) に点があるウインドウ」も候補にする。
+    /// ただし、点を含む一番手前のウインドウより後ろのウインドウは候補から外す
+    /// (前面ウインドウの内側をクリックしたのに背面ウインドウを誤検出しないため)。
     private func resizeTarget(atCGPoint cg: CGPoint) -> WindowInfo? {
         let wins = windowsFrontToBack()
+        let limit = wins.firstIndex { $0.bounds.contains(cg) }.map { $0 + 1 } ?? wins.count
+        let candidates = wins.prefix(limit)
         // 1) 点が内側にあり、かつ縁に近いウインドウを優先
-        if let w = wins.first(where: { $0.bounds.contains(cg) && isNearEdge(cgPoint: cg, of: $0.bounds) }) {
+        if let w = candidates.first(where: { $0.bounds.contains(cg) && isNearEdge(cgPoint: cg, of: $0.bounds) }) {
             return w
         }
         // 2) 点がウインドウの外側でも、縁の帯の中にあるウインドウ
-        return wins.first { isNearEdge(cgPoint: cg, of: $0.bounds) }
+        return candidates.first { isNearEdge(cgPoint: cg, of: $0.bounds) }
     }
 
     private func handleMouseUp() {
         draggingID = nil
+        dragStartSize = nil
+        hudVisible = false
         stopPolling()
         overlay.hide()
     }
 
     private func startPolling() {
         stopPolling()
-        // ドラッグ中は約60fpsでウインドウ矩形を追いかける (メインスレッドで回す)
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.draggingID != nil else { return }
-            self.pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-                self?.pollDraggingWindow()
-            }
+        // グローバルモニタのハンドラはメインスレッドで呼ばれるので、そのままタイマーを作る。
+        // ドラッグ中は約60fpsで対象ウインドウの矩形を追いかける
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.pollDraggingWindow()
         }
     }
 
@@ -258,7 +308,13 @@ final class ResizeTracker {
     }
 
     private func pollDraggingWindow() {
-        guard let id = draggingID, let win = window(withID: id) else { return }
+        guard let id = draggingID, let startSize = dragStartSize, let win = window(withID: id) else { return }
+        if !hudVisible {
+            // サイズが実際に変わるまでは表示しない
+            // (タイトルバーのクリック、ウインドウ移動、スクロールバー操作などを除外)
+            guard win.bounds.size != startSize else { return }
+            hudVisible = true
+        }
         overlay.show(windowRectCG: win.bounds, mouse: NSEvent.mouseLocation)
     }
 }
@@ -268,18 +324,10 @@ final class ResizeTracker {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tracker = ResizeTracker()
     private var statusItem: NSStatusItem?
-    private var trusted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        trusted = checkAccessibilityPermission(prompt: true)
         setupStatusItem()
         tracker.start()
-    }
-
-    private func checkAccessibilityPermission(prompt: Bool) -> Bool {
-        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let options = [key: prompt] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
     }
 
     private func setupStatusItem() {
@@ -290,14 +338,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aboutItem.target = self
         menu.addItem(aboutItem)
         menu.addItem(NSMenuItem.separator())
-        let stateTitle = trusted
-            ? "動作中: ウインドウの縁をドラッグするとサイズを表示します"
-            : "アクセシビリティ許可が必要です (設定後に再起動してください)"
-        menu.addItem(NSMenuItem(title: stateTitle, action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "動作中: ウインドウの縁をドラッグするとサイズを表示します", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        let settingsItem = NSMenuItem(title: "アクセシビリティ設定を開く", action: #selector(openAccessibilitySettings), keyEquivalent: "")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
         let quitItem = NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -312,12 +354,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         NSApp.activate(ignoringOtherApps: true)
         NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
-    }
-
-    @objc private func openAccessibilitySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
     }
 
     @objc private func quit() {
