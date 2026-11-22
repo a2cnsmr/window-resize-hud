@@ -1,0 +1,19 @@
+# ビルド中間ファイル (swift build で再生成される)
+.build/
+
+# 成果物 (build_app.sh で再生成される)
+WindowResizeHUD.app/
+
+# macOS / Finder
+.DS_Store
+
+# Swift Package Manager の個人用状態
+.swiftpm/
+
+# 証明書・秘密鍵 (絶対に公開しない)
+*.p12
+*.cer
+*.key
+
+.claude/
+
