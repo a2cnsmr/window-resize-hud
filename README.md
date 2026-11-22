@@ -63,3 +63,11 @@ security find-identity -v -p codesigning
 - `Package.swift` — SwiftPM定義
 - `build_app.sh` — ビルド＆アプリ化スクリプト (アイコン埋め込み・署名つき)
 - `AppIcon.iconset` / `AppIcon-1024.png` / `make_icon.py` — アイコン素材と生成スクリプト
+
+## 免責事項
+このソフトウェアは現状のまま提供され、明示／黙示を問わず一切の保証はありません。
+このソフトウェアの使用によって生じたいかなる損害についても、作者は責任を負いません。
+
+## 著作権
+Copyright © 2026 a2cnsmr. All rights reserved.
+ライセンスは付与していません (改変・再配布は許可していません)。
